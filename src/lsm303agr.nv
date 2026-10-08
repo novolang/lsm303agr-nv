@@ -1,0 +1,464 @@
+// lsm303agr — ST's LSM303AGR, a three-axis accelerometer and a
+// three-axis magnetometer in one package, on its I2C bus, as devices-nv's
+// `Accelerometer`, `Magnetometer` and `Identifiable`.
+//
+// The part answers at two I2C addresses: the accelerometer at 0x19 and
+// the magnetometer at 0x1E, the same addresses as the LSM303DLHC it
+// replaces on later boards, with other registers behind them.  The
+// magnetometer's address is fixed; a board's device table gives the
+// accelerometer's, which `attach` takes.
+//
+// The accelerometer's registers, as this driver uses them:
+//
+//   0x0F  WHO_AM_I_A    0x33
+//   0x20  CTRL_REG1_A   ODR (7:4), LPen (3), Zen, Yen, Xen (2:0)
+//   0x22  CTRL_REG3_A   I1_CLICK (7), I1_AOI1 (6), I1_AOI2 (5),
+//                       I1_DRDY1 (4), I1_DRDY2 (3), I1_WTM (2),
+//                       I1_OVERRUN (1)
+//   0x23  CTRL_REG4_A   BDU (7), BLE (6), FS (5:4), HR (3), ST (2:1),
+//                       SPI_ENABLE (0)
+//   0x25  CTRL_REG6_A   H_LACTIVE (1): the interrupt pins active low
+//   0x27  STATUS_REG_A  ZYXDA (3): a new sample of all three axes
+//   0x28  OUT_X_L_A to 0x2D OUT_Z_H_A: each axis a 16-bit two's
+//         complement count, low byte first, left-justified
+//
+// The magnetometer's:
+//
+//   0x4F  WHO_AM_I_M    0x40
+//   0x60  CFG_REG_A_M   COMP_TEMP_EN (7), REBOOT (6), SOFT_RST (5),
+//                       LP (4), ODR (3:2): 10, 20, 50, 100 Hz,
+//                       MD (1:0): 00 continuous, 01 single, 1x idle
+//   0x61  CFG_REG_B_M   OFF_CANC (1): offset cancellation
+//   0x62  CFG_REG_C_M   BDU (4), DRDY_ON_PIN (0)
+//   0x67  STATUS_REG_M  ZYXDA (3)
+//   0x68  OUTX_L_REG_M to 0x6D OUTZ_H_REG_M: each axis a 16-bit two's
+//         complement count, low byte first, X, Y, Z, at a fixed 1.5
+//         milligauss (150 nT) per step
+//
+// ST's LSM303AGR data sheet was not at hand when the driver was
+// written: ST's site did not serve it.  The addresses and bit fields
+// were taken from eldruin's `lsm303agr` crate (read at 1.1.0;
+// MIT/Apache, nothing written from it), the accelerometer's steps are
+// the ones the bench confirms (below), and all of it was checked on the
+// bench: WHO_AM_I_A and WHO_AM_I_M, every register this driver
+// writes read back, gravity on the axis that points down at each range,
+// and the Earth's field within its range.
+//
+// What that crate keeps, and this driver keeps, each named where it is
+// kept: bit 7 of the register address set for a multi-byte read, on
+// both halves of the part; block data update on both halves before any
+// sample is read (`init`).  One thing it does not keep: the crate takes
+// the ±16 g step in high-resolution mode as 8 mg; this driver takes
+// 11.72 mg, at which the bench reads gravity at ±16 g as 0.88 to 0.90 g,
+// where 8 mg would read it as 0.60 g.
+//
+// The driver holds no state: the range and the rate are read from the
+// part when they are needed, in the same transaction as the sample where
+// the sample needs them.
+//
+// The functions over a bus take it as a type parameter, so the tests run
+// them over a double of the part; the methods of `Lsm303agr` call them
+// with the board's bus.
+
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_mag.{ MagNanoT, Magnetometer }
+use dev_id.{ DeviceId, Identifiable }
+
+// The magnetometer's address.
+let MAG_ADDR = 0x1E
+
+// The accelerometer's registers.
+let WHO_AM_I_A   = 0x0F
+let CTRL_REG1_A  = 0x20
+let CTRL_REG3_A  = 0x22
+let CTRL_REG4_A  = 0x23
+let STATUS_REG_A = 0x27
+
+// The magnetometer's registers.
+let WHO_AM_I_M   = 0x4F
+let CFG_REG_A_M  = 0x60
+let CFG_REG_B_M  = 0x61
+let CFG_REG_C_M  = 0x62
+let STATUS_REG_M = 0x67
+let OUTX_L_REG_M = 0x68
+
+// Bit 7 of a register address: the address increments after each byte.
+// eldruin's `lsm303agr` sets it for every multi-byte read of either half
+// (`read_double_register`, `read_3_double_registers`); without it every
+// byte repeats the first register.
+let SUB_INCREMENT = 0x80
+
+// The identities.
+let ID_A = 0x33
+let ID_M = 0x40
+
+// CTRL_REG1_A: 100 Hz in normal mode with the three axes on.
+let CTRL1_A_ON = 0x57
+// CTRL_REG3_A: the accelerometer's data-ready on INT1.
+let CTRL3_A_DRDY1 = 0x10
+// CTRL_REG4_A: block data update and high resolution, so an axis is a
+// 12-bit count whose two bytes come from one sample.
+let CTRL4_A_BDU_HR = 0x88
+// The two STATUS registers: a new sample of all three axes.
+let STATUS_ZYXDA = 0x08
+
+// CFG_REG_A_M: 10 Hz, high resolution, converting continuously.
+let CFG_A_M_ON = 0x00
+// CFG_REG_B_M: offset cancellation, which takes the sensor's own offset
+// out of every sample.
+let CFG_B_M_OFF_CANC = 0x02
+// CFG_REG_C_M: block data update, and data-ready on the INT_MAG/DRDY pin.
+let CFG_C_M_BDU_DRDY = 0x11
+
+// The magnetometer's step: 1.5 milligauss, 150 nT.
+let MAG_NT_PER_LSB = 150
+
+// The I2C clock `begin` asks for: fast mode.
+let I2C_HZ = 400000
+
+// ── Register access ──────────────────────────────────────────────────
+
+// The magnetometer's wiring: the accelerometer's bus and interrupt
+// line, the magnetometer's fixed address.
+fn mag_wiring(w: DeviceWiring) -> DeviceWiring
+    DeviceWiring { bus: w.bus, addr: Some(MAG_ADDR), cs: None, irq: w.irq }
+
+// The register address that goes out for a read of `n` registers from
+// `reg`: bit 7 set for more than one.
+fn sub_of(reg: Int, n: Int) -> Int
+    if n > 1
+        return reg | SUB_INCREMENT
+    reg
+
+// Reads `n` accelerometer registers from `reg` into `dst` in one
+// transaction: whether the part answered.
+pub fn accel_regs_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                  var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, sub_of(reg, n), n, dst)
+
+// Reads `n` magnetometer registers from `reg` into `dst` in one
+// transaction: whether the part answered.
+pub fn mag_regs_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, mag_wiring(w), sub_of(reg, n), n, dst)
+
+// One accelerometer register, or `None` when the part did not answer.
+pub fn accel_reg_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not accel_regs_into(bus, w, reg, 1, b)
+        return None
+    Some(b[0] as Int)
+
+// One magnetometer register, or `None` when the part did not answer.
+pub fn mag_reg_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not mag_regs_into(bus, w, reg, 1, b)
+        return None
+    Some(b[0] as Int)
+
+// Writes one register at `w` and reads it back: whether the part
+// acknowledged and holds the value.
+fn reg_write_at<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push((v & 0xFF) as u8)
+    if not dev_bus.wiring_write_from(bus, w, reg, src)
+        return false
+    var b: DevBytes = Vec.new()
+    let _ = dev_bus.wiring_read_into(bus, w, reg, 1, b)
+    b.len() == 1 and (b[0] as Int) == (v & 0xFF)
+
+// Writes an accelerometer register and reads it back.
+pub fn accel_reg_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    reg_write_at(bus, w, reg, v)
+
+// Writes a magnetometer register and reads it back.
+pub fn mag_reg_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    reg_write_at(bus, mag_wiring(w), reg, v)
+
+// ── The accelerometer ────────────────────────────────────────────────
+
+// The range a CTRL_REG4_A byte's FS bits select.
+pub fn accel_range_of_ctrl4(v: Int) -> AccelRange
+    match (v >> 4) & 3
+        0 => AccelRange2g
+        1 => AccelRange4g
+        2 => AccelRange8g
+        _ => AccelRange16g
+
+// The FS bits for a range.
+pub fn accel_fs_of_range(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange4g  => 1
+        AccelRange8g  => 2
+        AccelRange16g => 3
+
+// The sensitivity of a range in micro-g per step of the 12-bit count in
+// high-resolution mode: 0.98, 1.95, 3.9 and 11.72 mg.  The ±16 g step is
+// not 16 g over 2^11.
+pub fn accel_ug_per_lsb(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 980
+        AccelRange4g  => 1950
+        AccelRange8g  => 3900
+        AccelRange16g => 11720
+
+// The rate in hertz a CTRL_REG1_A byte selects in normal or
+// high-resolution mode, 0 when the part is powered down.  ODR 1000 is
+// 1620 Hz in low-power mode only, which the driver does not set, and
+// reads as 0.
+pub fn accel_rate_of_ctrl1(v: Int) -> Int
+    match (v >> 4) & 15
+        1 => 1
+        2 => 10
+        3 => 25
+        4 => 50
+        5 => 100
+        6 => 200
+        7 => 400
+        9 => 1344
+        _ => 0
+
+// The ODR bits of the slowest rate at or above `hz`, or of the fastest,
+// 1344 Hz, for a rate beyond it.
+pub fn accel_odr_for_rate(hz: Int) -> Int
+    if hz <= 1
+        return 1
+    if hz <= 10
+        return 2
+    if hz <= 25
+        return 3
+    if hz <= 50
+        return 4
+    if hz <= 100
+        return 5
+    if hz <= 200
+        return 6
+    if hz <= 400
+        return 7
+    9
+
+// The milli-g of an axis whose low byte is at `i` of `b`, in the range
+// `r`: the 16-bit count is the 12-bit one shifted left by 4, so it is
+// shifted back with its sign kept.
+fn accel_axis(b: DevBytes, i: Int, r: AccelRange) -> Int
+    let raw = dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16) >> 4
+    raw * accel_ug_per_lsb(r) / 1000
+
+// The most recent sample, in one transaction of eleven registers from
+// CTRL_REG4_A to OUT_Z_H_A, so the range it is converted with is the one
+// it was taken in: CTRL_REG4_A, CTRL_REG5_A, CTRL_REG6_A, REFERENCE_A,
+// STATUS_REG_A, then the three axes.  `None` when the part did not
+// answer.
+pub fn accel_sample_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?AccelMilliG [hw]
+    var b: DevBytes = Vec.new()
+    if not accel_regs_into(bus, w, CTRL_REG4_A, 11, b)
+        return None
+    let r = accel_range_of_ctrl4(b[0] as Int)
+    Some(AccelMilliG { x: accel_axis(b, 5, r), y: accel_axis(b, 7, r), z: accel_axis(b, 9, r) })
+
+// Whether a new sample of all three axes has completed since the last
+// read: STATUS_REG_A's ZYXDA.
+pub fn accel_sample_ready<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    ((accel_reg_read(bus, w, STATUS_REG_A) ?? 0) & STATUS_ZYXDA) != 0
+
+// The range the part is set to, ±2 g when it does not answer.
+pub fn accel_range_read<B: I2cBus>(bus: B, w: DeviceWiring) -> AccelRange [hw]
+    accel_range_of_ctrl4(accel_reg_read(bus, w, CTRL_REG4_A) ?? 0)
+
+// Sets the range, with block data update and high resolution on:
+// whether the part took it.
+pub fn accel_range_write<B: I2cBus>(bus: B, w: DeviceWiring, r: AccelRange) -> Bool [hw]
+    accel_reg_write(bus, w, CTRL_REG4_A, CTRL4_A_BDU_HR | (accel_fs_of_range(r) << 4))
+
+// The rate the part samples at in hertz, 0 when it is powered down or
+// does not answer.
+pub fn accel_rate_read<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    accel_rate_of_ctrl1(accel_reg_read(bus, w, CTRL_REG1_A) ?? 0)
+
+// Sets the slowest rate at or above `hz` with the three axes on: the rate
+// the part took in hertz, or 0 when it did not take it.
+pub fn accel_rate_write<B: I2cBus>(bus: B, w: DeviceWiring, hz: Int) -> Int [hw]
+    let v = (accel_odr_for_rate(hz) << 4) | 0x07
+    if not accel_reg_write(bus, w, CTRL_REG1_A, v)
+        return 0
+    accel_rate_of_ctrl1(v)
+
+// ── The magnetometer ─────────────────────────────────────────────────
+
+// The signed count of an axis whose low byte is at `i` of `b`.
+fn mag_axis(b: DevBytes, i: Int) -> Int
+    dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16)
+
+// The most recent sample, in one transaction of the six output
+// registers, X, Y and Z, at 150 nT per step.  `None` when the part did
+// not answer.
+pub fn mag_sample_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?MagNanoT [hw]
+    var b: DevBytes = Vec.new()
+    if not mag_regs_into(bus, w, OUTX_L_REG_M, 6, b)
+        return None
+    Some(MagNanoT { x: mag_axis(b, 0) * MAG_NT_PER_LSB,
+                    y: mag_axis(b, 2) * MAG_NT_PER_LSB,
+                    z: mag_axis(b, 4) * MAG_NT_PER_LSB })
+
+// Whether a new sample has completed since the last read: STATUS_REG_M's
+// ZYXDA.
+pub fn mag_sample_ready<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    ((mag_reg_read(bus, w, STATUS_REG_M) ?? 0) & STATUS_ZYXDA) != 0
+
+// The rate in hertz a CFG_REG_A_M byte selects, 0 when the magnetometer
+// is idle (MD 1x).
+pub fn mag_rate_of_cfg_a(v: Int) -> Int
+    if (v & 2) != 0
+        return 0
+    match (v >> 2) & 3
+        0 => 10
+        1 => 20
+        2 => 50
+        _ => 100
+
+// The ODR bits of the slowest rate at or above `hz`, or of the fastest,
+// 100 Hz, for a rate beyond it.
+pub fn mag_odr_for_rate(hz: Int) -> Int
+    if hz <= 10
+        return 0
+    if hz <= 20
+        return 1
+    if hz <= 50
+        return 2
+    3
+
+// The rate the magnetometer samples at in hertz, 0 when it is idle or
+// does not answer.
+pub fn mag_rate_read<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    match mag_reg_read(bus, w, CFG_REG_A_M)
+        Some(v) => mag_rate_of_cfg_a(v)
+        None    => 0
+
+// Sets the magnetometer's rate to the slowest at or above `hz`,
+// converting continuously in high resolution: the rate taken in hertz,
+// or 0 when the part did not take it.
+pub fn mag_rate_write<B: I2cBus>(bus: B, w: DeviceWiring, hz: Int) -> Int [hw]
+    let v = mag_odr_for_rate(hz) << 2
+    if not mag_reg_write(bus, w, CFG_REG_A_M, v)
+        return 0
+    mag_rate_of_cfg_a(v)
+
+// ── Identity and bring-up ────────────────────────────────────────────
+
+// The identity as one number, WHO_AM_I_A in the high byte and WHO_AM_I_M
+// in the low one, 0x3340 for this part; `None` when either half does not
+// answer.
+pub fn id_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?DeviceId [hw]
+    let Some(a) = accel_reg_read(bus, w, WHO_AM_I_A) else return None
+    let Some(m) = mag_reg_read(bus, w, WHO_AM_I_M) else return None
+    Some(DeviceId { who: (a << 8) | m, rev: None })
+
+// Brings the part up: the bus at 400 kHz; the accelerometer at ±2 g in
+// high resolution with block data update, its data-ready on INT1, and
+// 100 Hz with the three axes on; the magnetometer with block data update
+// and its data-ready on its pin, offset cancellation, and 10 Hz in high
+// resolution, converting continuously.  The interrupt pin, when the
+// wiring has one, is made an input.  Answers whether the part answered
+// as an LSM303AGR and took every setting.
+pub fn start<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(I2C_HZ)
+    let Some(id) = id_read(bus, w) else return false
+    if id.who != ((ID_A << 8) | ID_M)
+        return false
+    // Each setting is written and read back; the first the part refuses
+    // ends the bring-up.  Block data update goes on before either half
+    // converts, as eldruin's `lsm303agr` does in `init`.
+    let accel_ok = accel_reg_write(bus, w, CTRL_REG4_A, CTRL4_A_BDU_HR) and accel_reg_write(bus, w, CTRL_REG3_A, CTRL3_A_DRDY1) and accel_reg_write(bus, w, CTRL_REG1_A, CTRL1_A_ON)
+    accel_ok and mag_reg_write(bus, w, CFG_REG_C_M, CFG_C_M_BDU_DRDY) and mag_reg_write(bus, w, CFG_REG_B_M, CFG_B_M_OFF_CANC) and mag_reg_write(bus, w, CFG_REG_A_M, CFG_A_M_ON)
+
+// The level of the part's INT1 line on the board, 1 or 0, or -1 for a
+// wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── The driver ───────────────────────────────────────────────────────
+
+// The part on a board: the I2C bus, the board's GPIO for the interrupt
+// line, and the wiring, whose address is the accelerometer's.
+pub @value
+struct Lsm303agr
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Lsm303agr
+    // The part on the board's I2C bus with the accelerometer at
+    // `w.addr`, as a board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Lsm303agr
+        Lsm303agr { bus: bus, pins: pins, w: w }
+
+    // Brings the part up (`start`): whether it answered as an LSM303AGR
+    // and took every setting.
+    fn begin(self) -> Bool [hw]
+        start(self.bus, self.pins, self.w)
+
+    // The level of the INT1 line, -1 when the wiring has none.
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    // Sets the magnetometer's rate to the slowest at or above `hz`, 10 to
+    // 100 Hz, and answers the rate taken, 0 when the part did not take it.
+    fn mag_set_rate_hz(self, hz: Int) -> Int [hw]
+        mag_rate_write(self.bus, self.w, hz)
+
+    // One accelerometer register's byte, `None` when it did not answer.
+    fn accel_reg(self, r: Int) -> ?Int [hw]
+        accel_reg_read(self.bus, self.w, r)
+
+    // Writes an accelerometer register and reads it back.
+    fn set_accel_reg(self, r: Int, v: Int) -> Bool [hw]
+        accel_reg_write(self.bus, self.w, r, v)
+
+    // One magnetometer register's byte, `None` when it did not answer.
+    fn mag_reg(self, r: Int) -> ?Int [hw]
+        mag_reg_read(self.bus, self.w, r)
+
+    // Writes a magnetometer register and reads it back.
+    fn set_mag_reg(self, r: Int, v: Int) -> Bool [hw]
+        mag_reg_write(self.bus, self.w, r, v)
+
+impl Accelerometer[hw] for Lsm303agr
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        accel_sample_read(self.bus, self.w)
+
+    fn accel_ready(self) -> Bool [hw]
+        accel_sample_ready(self.bus, self.w)
+
+    fn accel_range(self) -> AccelRange [hw]
+        accel_range_read(self.bus, self.w)
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        accel_range_write(self.bus, self.w, r)
+
+    fn accel_rate_hz(self) -> Int [hw]
+        accel_rate_read(self.bus, self.w)
+
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        accel_rate_write(self.bus, self.w, hz)
+
+impl Magnetometer[hw] for Lsm303agr
+    fn mag_read(self) -> ?MagNanoT [hw]
+        mag_sample_read(self.bus, self.w)
+
+    fn mag_ready(self) -> Bool [hw]
+        mag_sample_ready(self.bus, self.w)
+
+    fn mag_rate_hz(self) -> Int [hw]
+        mag_rate_read(self.bus, self.w)
+
+impl Identifiable[hw] for Lsm303agr
+    // WHO_AM_I_A (0x33) and WHO_AM_I_M (0x40) as one number, 0x3340; the
+    // part keeps no revision register, so `rev` is `None`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self.bus, self.w)
