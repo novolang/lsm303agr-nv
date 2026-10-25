@@ -1,0 +1,23 @@
+[package]
+name        = "lsm303agr-nv"
+version     = "0.1.0"
+description = "A driver for ST's LSM303AGR, a three-axis accelerometer and a three-axis magnetometer in one package, on an I2C bus: acceleration in milli-g and the magnetic field in nanotesla, the ranges and sample rates, the data-ready line and the part's identity, as devices-nv's Accelerometer, Magnetometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["lsm303agr", "accelerometer", "magnetometer", "compass", "i2c", "sensor", "stm32f3discovery"]
+repository  = "https://github.com/novolang/lsm303agr-nv"
+maintainers = ["novo-lang"]
+# The toolchain floor: 0.19.3 checks each module's generic functions
+# against its own module, which a program needs when it binds this
+# driver beside another that also declares `start` and `irq_level_of`.
+novo        = ">= 0.19.3"
+
+[dependencies]
+# The board's I2C bus and GPIO handles, and the I2cBus and GpioOut
+# traits they implement.
+embedded-hal-nv = "^0.2.1"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the Accelerometer, Magnetometer and Identifiable traits.
+devices-nv      = "^0.2.0"
