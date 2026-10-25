@@ -136,25 +136,25 @@ fn sub_of(reg: Int, n: Int) -> Int
 // transaction: whether the part answered.
 pub fn accel_regs_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
                                   var dst: DevBytes) -> Bool [hw]
-    dev_bus.wiring_read_into(bus, w, sub_of(reg, n), n, dst)
+    dev_bus.wiring_read_into(bus, w, sub_of(reg, n), n, var dst)
 
 // Reads `n` magnetometer registers from `reg` into `dst` in one
 // transaction: whether the part answered.
 pub fn mag_regs_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
                                 var dst: DevBytes) -> Bool [hw]
-    dev_bus.wiring_read_into(bus, mag_wiring(w), sub_of(reg, n), n, dst)
+    dev_bus.wiring_read_into(bus, mag_wiring(w), sub_of(reg, n), n, var dst)
 
 // One accelerometer register, or `None` when the part did not answer.
 pub fn accel_reg_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not accel_regs_into(bus, w, reg, 1, b)
+    if not accel_regs_into(bus, w, reg, 1, var b)
         return None
     Some(b[0] as Int)
 
 // One magnetometer register, or `None` when the part did not answer.
 pub fn mag_reg_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not mag_regs_into(bus, w, reg, 1, b)
+    if not mag_regs_into(bus, w, reg, 1, var b)
         return None
     Some(b[0] as Int)
 
@@ -166,7 +166,7 @@ fn reg_write_at<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [h
     if not dev_bus.wiring_write_from(bus, w, reg, src)
         return false
     var b: DevBytes = Vec.new()
-    let _ = dev_bus.wiring_read_into(bus, w, reg, 1, b)
+    let _ = dev_bus.wiring_read_into(bus, w, reg, 1, var b)
     b.len() == 1 and (b[0] as Int) == (v & 0xFF)
 
 // Writes an accelerometer register and reads it back.
@@ -254,7 +254,7 @@ fn accel_axis(b: DevBytes, i: Int, r: AccelRange) -> Int
 // answer.
 pub fn accel_sample_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?AccelMilliG [hw]
     var b: DevBytes = Vec.new()
-    if not accel_regs_into(bus, w, CTRL_REG4_A, 11, b)
+    if not accel_regs_into(bus, w, CTRL_REG4_A, 11, var b)
         return None
     let r = accel_range_of_ctrl4(b[0] as Int)
     Some(AccelMilliG { x: accel_axis(b, 5, r), y: accel_axis(b, 7, r), z: accel_axis(b, 9, r) })
@@ -297,7 +297,7 @@ fn mag_axis(b: DevBytes, i: Int) -> Int
 // not answer.
 pub fn mag_sample_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?MagNanoT [hw]
     var b: DevBytes = Vec.new()
-    if not mag_regs_into(bus, w, OUTX_L_REG_M, 6, b)
+    if not mag_regs_into(bus, w, OUTX_L_REG_M, 6, var b)
         return None
     Some(MagNanoT { x: mag_axis(b, 0) * MAG_NT_PER_LSB,
                     y: mag_axis(b, 2) * MAG_NT_PER_LSB,
@@ -392,6 +392,7 @@ struct Lsm303agr
     pins: BoardGpio
     w: DeviceWiring
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Lsm303agr
     // The part on the board's I2C bus with the accelerometer at
     // `w.addr`, as a board's device table builds it.  Nothing is sent.
@@ -428,6 +429,7 @@ impl Lsm303agr
     fn set_mag_reg(self, r: Int, v: Int) -> Bool [hw]
         mag_reg_write(self.bus, self.w, r, v)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Accelerometer[hw] for Lsm303agr
     fn accel_read(self) -> ?AccelMilliG [hw]
         accel_sample_read(self.bus, self.w)
@@ -447,6 +449,7 @@ impl Accelerometer[hw] for Lsm303agr
     fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
         accel_rate_write(self.bus, self.w, hz)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Magnetometer[hw] for Lsm303agr
     fn mag_read(self) -> ?MagNanoT [hw]
         mag_sample_read(self.bus, self.w)
@@ -457,6 +460,7 @@ impl Magnetometer[hw] for Lsm303agr
     fn mag_rate_hz(self) -> Int [hw]
         mag_rate_read(self.bus, self.w)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Identifiable[hw] for Lsm303agr
     // WHO_AM_I_A (0x33) and WHO_AM_I_M (0x40) as one number, 0x3340; the
     // part keeps no revision register, so `rev` is `None`.
