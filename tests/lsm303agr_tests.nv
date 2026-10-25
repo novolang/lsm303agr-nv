@@ -1,0 +1,231 @@
+// lsm303agr_tests — the driver's functions over a double of the part:
+// an I2C bus with an LSM303AGR's two halves on it, the accelerometer at
+// 0x19 and the magnetometer at 0x1E, each a register file whose address
+// increments after a byte when bit 7 of the register address is set.
+// The board's suite runs the same functions over the board's bus.
+
+use std.test
+use embedded_hal.{ I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring }
+use dev_accel.{ AccelRange }
+use lsm303agr
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` holds both halves' registers, keyed by address × 256 +
+// register.  `answers` holds 1 for each address a part answers at.  The
+// maps are changed through the receiver.
+
+struct FakeBus
+    regs: HashMap<Int, Int>
+    answers: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+impl I2cBus for FakeBus
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if at(self.answers, addr) == 0 or data.len() == 0
+            return false
+        let sub = data[0] as Int
+        var r = sub & 0x7F
+        for i in 1..data.len()
+            self.regs.insert(addr * 256 + r, data[i] as Int)
+            if (sub & 0x80) != 0
+                r = r + 1
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if at(self.answers, addr) == 0
+            return None
+        let sub = tx[0] as Int
+        var r = sub & 0x7F
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, at(self.regs, addr * 256 + r) as u8)
+            if (sub & 0x80) != 0
+                r = r + 1
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+// A part with both halves answering and their identities in place.
+fn part() -> FakeBus
+    let b = FakeBus { regs: HashMap.new(), answers: HashMap.new() }
+    b.answers.insert(0x19, 1)
+    b.answers.insert(0x1E, 1)
+    b.regs.insert(0x19 * 256 + 0x0F, 0x33)
+    b.regs.insert(0x1E * 256 + 0x4F, 0x40)
+    b.regs.insert(0x1E * 256 + 0x60, 0x03)
+    b
+
+fn pins() -> FakePins
+    FakePins { levels: HashMap.new(), modes: HashMap.new() }
+
+fn poke(b: FakeBus, addr: Int, reg: Int, v: Int)
+    b.regs.insert(addr * 256 + reg, v)
+
+fn peek(b: FakeBus, addr: Int, reg: Int) -> Int
+    at(b.regs, addr * 256 + reg)
+
+// A 16-bit count, low byte first, at `reg`.
+fn put16(b: FakeBus, addr: Int, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    poke(b, addr, reg, u & 0xFF)
+    poke(b, addr, reg + 1, u >> 8)
+
+// The board's wiring: the accelerometer at 0x19, INT1 on PE4 (68).
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x19), 68)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_an_accelerometer_sample_is_12_bit_left_justified() [io, hw]
+    let b = part()
+    poke(b, 0x19, 0x23, 0x88)
+    // 1024 steps of 0.98 mg, shifted left by 4; and -512 steps.
+    put16(b, 0x19, 0x28, 1024 << 4)
+    put16(b, 0x19, 0x2A, -512 << 4)
+    put16(b, 0x19, 0x2C, 0)
+    match lsm303agr.accel_sample_read(b, wiring())
+        Some(s) =>
+            test.assert_eq(s.x, 1003)
+            test.assert_eq(s.y, -501)
+            test.assert_eq(s.z, 0)
+        None => test.assert(false)
+
+@test
+fn test_the_16g_step_is_11_72_mg() [io, hw]
+    let b = part()
+    poke(b, 0x19, 0x23, 0xB8)
+    put16(b, 0x19, 0x28, 100 << 4)
+    match lsm303agr.accel_sample_read(b, wiring())
+        Some(s) => test.assert_eq(s.x, 1172)
+        None => test.assert(false)
+
+@test
+fn test_a_magnetometer_sample_is_150_nt_a_step_x_y_z() [io, hw]
+    let b = part()
+    put16(b, 0x1E, 0x68, 100)
+    put16(b, 0x1E, 0x6A, -20)
+    put16(b, 0x1E, 0x6C, 300)
+    match lsm303agr.mag_sample_read(b, wiring())
+        Some(s) =>
+            test.assert_eq(s.x, 15000)
+            test.assert_eq(s.y, -3000)
+            test.assert_eq(s.z, 45000)
+        None => test.assert(false)
+
+@test
+fn test_a_part_that_does_not_answer() [io, hw]
+    let b = part()
+    let lost = dev_bus.wiring_i2c(0, 0x50)
+    test.assert(lsm303agr.accel_sample_read(b, lost) == None)
+    test.assert(lsm303agr.id_read(b, lost) == None)
+    test.assert(lsm303agr.accel_range_read(b, lost) == AccelRange2g)
+    test.assert_eq(lsm303agr.accel_rate_read(b, lost), 0)
+    test.assert_eq(lsm303agr.accel_rate_write(b, lost, 100), 0)
+    test.assert(not lsm303agr.accel_reg_write(b, lost, 0x20, 0x57))
+    test.assert(not lsm303agr.start(b, pins(), lost))
+    b.answers.insert(0x1E, 0)
+    test.assert(lsm303agr.mag_sample_read(b, wiring()) == None)
+    test.assert_eq(lsm303agr.mag_rate_read(b, wiring()), 0)
+    test.assert_eq(lsm303agr.mag_rate_write(b, wiring(), 10), 0)
+    test.assert(not lsm303agr.mag_sample_ready(b, wiring()))
+
+@test
+fn test_the_data_ready_flags() [io, hw]
+    let b = part()
+    test.assert(not lsm303agr.accel_sample_ready(b, wiring()))
+    poke(b, 0x19, 0x27, 0x08)
+    test.assert(lsm303agr.accel_sample_ready(b, wiring()))
+    poke(b, 0x1E, 0x67, 0x08)
+    test.assert(lsm303agr.mag_sample_ready(b, wiring()))
+
+// ── Ranges and rates ─────────────────────────────────────────────────
+
+@test
+fn test_the_ranges() [io, hw]
+    let b = part()
+    test.assert(lsm303agr.accel_range_write(b, wiring(), AccelRange8g))
+    test.assert_eq(peek(b, 0x19, 0x23), 0xA8)
+    test.assert(lsm303agr.accel_range_read(b, wiring()) == AccelRange8g)
+    test.assert(lsm303agr.accel_range_of_ctrl4(0x10) == AccelRange4g)
+    test.assert(lsm303agr.accel_range_of_ctrl4(0x30) == AccelRange16g)
+    test.assert_eq(lsm303agr.accel_ug_per_lsb(AccelRange2g), 980)
+
+@test
+fn test_the_accelerometer_rates_round_up() [io, hw]
+    let b = part()
+    test.assert_eq(lsm303agr.accel_rate_write(b, wiring(), 60), 100)
+    test.assert_eq(peek(b, 0x19, 0x20), 0x57)
+    test.assert_eq(lsm303agr.accel_rate_write(b, wiring(), 401), 1344)
+    test.assert_eq(lsm303agr.accel_rate_read(b, wiring()), 1344)
+    test.assert_eq(lsm303agr.accel_rate_of_ctrl1(0x87), 0)
+    test.assert_eq(lsm303agr.accel_odr_for_rate(1), 1)
+    test.assert_eq(lsm303agr.accel_odr_for_rate(200), 6)
+
+@test
+fn test_the_magnetometer_rates() [io, hw]
+    let b = part()
+    // At reset the magnetometer is idle.
+    test.assert_eq(lsm303agr.mag_rate_read(b, wiring()), 0)
+    test.assert_eq(lsm303agr.mag_rate_write(b, wiring(), 30), 50)
+    test.assert_eq(peek(b, 0x1E, 0x60), 0x08)
+    test.assert_eq(lsm303agr.mag_rate_write(b, wiring(), 11), 20)
+    test.assert_eq(lsm303agr.mag_rate_write(b, wiring(), 500), 100)
+    test.assert_eq(lsm303agr.mag_rate_of_cfg_a(0x00), 10)
+
+// ── Identity and bring-up ────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_both_halves() [io, hw]
+    match lsm303agr.id_read(part(), wiring())
+        Some(id) => test.assert_eq(id.who, 0x3340)
+        None => test.assert(false)
+
+@test
+fn test_the_bring_up_writes_both_halves() [io, hw]
+    let b = part()
+    let g = pins()
+    test.assert(lsm303agr.start(b, g, wiring()))
+    test.assert_eq(peek(b, 0x19, 0x23), 0x88)
+    test.assert_eq(peek(b, 0x19, 0x22), 0x10)
+    test.assert_eq(peek(b, 0x19, 0x20), 0x57)
+    test.assert_eq(peek(b, 0x1E, 0x62), 0x11)
+    test.assert_eq(peek(b, 0x1E, 0x61), 0x02)
+    test.assert_eq(peek(b, 0x1E, 0x60), 0x00)
+    test.assert_eq(at(g.modes, 68), 0)
+
+@test
+fn test_another_part_at_the_address_is_refused() [io, hw]
+    let b = part()
+    poke(b, 0x19, 0x0F, 0x44)
+    test.assert(not lsm303agr.start(b, pins(), wiring()))
+    test.assert_eq(peek(b, 0x19, 0x20), 0)
+
+@test
+fn test_the_interrupt_line() [io, hw]
+    let g = pins()
+    g.levels.insert(68, 1)
+    test.assert_eq(lsm303agr.irq_level_of(g, wiring()), 1)
+    test.assert_eq(lsm303agr.irq_level_of(g, dev_bus.wiring_i2c(0, 0x19)), -1)
