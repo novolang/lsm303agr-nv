@@ -123,7 +123,7 @@ let I2C_HZ = 400000
 // The magnetometer's wiring: the accelerometer's bus and interrupt
 // line, the magnetometer's fixed address.
 fn mag_wiring(w: DeviceWiring) -> DeviceWiring
-    DeviceWiring { bus: w.bus, addr: Some(MAG_ADDR), cs: None, irq: w.irq }
+    DeviceWiring { bus: w.bus, addr: Some(MAG_ADDR), cs: None, irq: w.irq, en: w.en }
 
 // The register address that goes out for a read of `n` registers from
 // `reg`: bit 7 set for more than one.

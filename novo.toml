@@ -1,6 +1,6 @@
 [package]
 name        = "lsm303agr-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "A driver for ST's LSM303AGR, a three-axis accelerometer and a three-axis magnetometer in one package, on an I2C bus: acceleration in milli-g and the magnetic field in nanotesla, the ranges and sample rates, the data-ready line and the part's identity, as devices-nv's Accelerometer, Magnetometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -20,4 +20,4 @@ novo        = ">= 0.21.1"
 embedded-hal-nv = "^0.2.1"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the Accelerometer, Magnetometer and Identifiable traits.
-devices-nv      = "^0.2.0"
+devices-nv      = "^0.3.2"
