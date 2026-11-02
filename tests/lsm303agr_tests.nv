@@ -99,6 +99,53 @@ fn wiring() -> DeviceWiring
 // ── Samples ──────────────────────────────────────────────────────────
 
 @test
+fn test_a_run_of_registers_sets_the_increment_bit_and_lands_in_the_buffer() [io, hw]
+    let b = part()
+    poke(b, 0x19, 0x28, 11)
+    poke(b, 0x19, 0x29, 22)
+    poke(b, 0x1E, 0x68, 33)
+    poke(b, 0x1E, 0x69, 44)
+    var acc: dev_bus.DevBytes = Vec.new()
+    test.assert(lsm303agr.accel_regs_into(b, wiring(), 0x28, 2, var acc))
+    test.assert_eq(acc[0] as Int, 11)
+    test.assert_eq(acc[1] as Int, 22)
+    var mag: dev_bus.DevBytes = Vec.new()
+    test.assert(lsm303agr.mag_regs_into(b, wiring(), 0x68, 2, var mag))
+    test.assert_eq(mag[0] as Int, 33)
+    test.assert_eq(mag[1] as Int, 44)
+
+@test
+fn test_a_single_register_of_each_half_reads_and_a_silent_half_is_none() [io, hw]
+    let b = part()
+    poke(b, 0x19, 0x20, 0x57)
+    poke(b, 0x1E, 0x60, 0x0C)
+    test.assert_eq(lsm303agr.accel_reg_read(b, wiring(), 0x20) ?? -1, 0x57)
+    test.assert_eq(lsm303agr.mag_reg_read(b, wiring(), 0x60) ?? -1, 0x0C)
+    b.answers.insert(0x1E, 0)
+    test.assert(lsm303agr.mag_reg_read(b, wiring(), 0x60) == None)
+    b.answers.insert(0x19, 0)
+    test.assert(lsm303agr.accel_reg_read(b, wiring(), 0x20) == None)
+
+@test
+fn test_a_magnetometer_write_is_read_back_and_a_silent_half_refuses() [io, hw]
+    let b = part()
+    test.assert(lsm303agr.mag_reg_write(b, wiring(), 0x61, 0x10))
+    test.assert_eq(peek(b, 0x1E, 0x61), 0x10)
+    b.answers.insert(0x1E, 0)
+    test.assert(not lsm303agr.mag_reg_write(b, wiring(), 0x61, 0x20))
+
+@test
+fn test_the_magnetometer_rate_code_is_the_slowest_that_covers_the_request() [io, hw]
+    test.assert_eq(lsm303agr.mag_odr_for_rate(1), 0)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(10), 0)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(11), 1)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(20), 1)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(21), 2)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(50), 2)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(51), 3)
+    test.assert_eq(lsm303agr.mag_odr_for_rate(900), 3)
+
+@test
 fn test_an_accelerometer_sample_is_12_bit_left_justified() [io, hw]
     let b = part()
     poke(b, 0x19, 0x23, 0x88)
@@ -111,7 +158,7 @@ fn test_an_accelerometer_sample_is_12_bit_left_justified() [io, hw]
             test.assert_eq(s.x, 1003)
             test.assert_eq(s.y, -501)
             test.assert_eq(s.z, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_16g_step_is_11_72_mg() [io, hw]
@@ -120,7 +167,7 @@ fn test_the_16g_step_is_11_72_mg() [io, hw]
     put16(b, 0x19, 0x28, 100 << 4)
     match lsm303agr.accel_sample_read(b, wiring())
         Some(s) => test.assert_eq(s.x, 1172)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_magnetometer_sample_is_150_nt_a_step_x_y_z() [io, hw]
@@ -133,7 +180,7 @@ fn test_a_magnetometer_sample_is_150_nt_a_step_x_y_z() [io, hw]
             test.assert_eq(s.x, 15000)
             test.assert_eq(s.y, -3000)
             test.assert_eq(s.z, 45000)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_part_that_does_not_answer() [io, hw]
@@ -201,7 +248,7 @@ fn test_the_magnetometer_rates() [io, hw]
 fn test_the_identity_is_both_halves() [io, hw]
     match lsm303agr.id_read(part(), wiring())
         Some(id) => test.assert_eq(id.who, 0x3340)
-        None => test.assert(false)
+        None     => test.assert(false)
 
 @test
 fn test_the_bring_up_writes_both_halves() [io, hw]
